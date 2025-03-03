@@ -78,14 +78,15 @@ def table(data):
     # convert dict into list of dicts (for single row query)
     if isinstance(data, dict):
         data = [data]
-    headers = data[0].keys()
-    col_widths = {header: max(len(header), max(len(str(row[header])) for row in data)) for header in headers}
-    header_row = "  ".join(header.ljust(col_widths[header]) for header in headers)
-    print(header_row)
-    # Print a separator line
-    print("  ".join("-" * col_widths[header] for header in headers))
-    for row in data:
-        print("  ".join(str(row[header]).ljust(col_widths[header]) for header in headers))
+    if len(data):
+        headers = data[0].keys()
+        col_widths = {header: max(len(header), max(len(str(row[header])) for row in data)) for header in headers}
+        header_row = "  ".join(header.ljust(col_widths[header]) for header in headers)
+        print(header_row)
+        # Print a separator line
+        print("  ".join("-" * col_widths[header] for header in headers))
+        for row in data:
+            print("  ".join(str(row[header]).ljust(col_widths[header]) for header in headers))
 
 
 def get_arg(name, prompt, default=''):
@@ -152,6 +153,51 @@ def insert(db, table, data):
     return False
 
 
+def update(db, table, data, where):
+    cursor = db.cursor()
+    columns = list(data.keys())
+    values = list(data.values())
+
+    # Fix dates from datetime.datetime.now() to normal ISO format for db
+    values = [
+        value.strftime('%Y-%m-%d %H:%M:%S%z') if isinstance(value, datetime.datetime) else value
+        for value in values
+    ]
+
+    # Generate the SET part of the query (column = value)
+    set_clause = sql.SQL(", ").join(
+        sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()) for col in columns
+    )
+
+    # Build the WHERE part of the query from the 'where' dictionary
+    where_clause = sql.SQL(" AND ").join(
+        sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder()) for k in where.keys()
+    )
+
+    # Construct the final query
+    query = sql.SQL("UPDATE {} SET {} WHERE {}").format(
+        sql.Identifier(table),  # Safely insert the table name
+        set_clause,  # SET clause for column-value pairs
+        where_clause  # WHERE clause to filter the rows
+    )
+
+    try:
+        # Combine values from data and where
+        query_values = values + list(where.values())
+        cursor.execute(query, query_values)
+        db.commit()
+        if cursor.rowcount > 0:
+            return True  # Return True if at least one row was updated
+        else:
+            return False  # Return False if no rows were updated
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating record: {e}")
+    finally:
+        cursor.close()
+    return False
+
+
 # Find a client by nickname
 def find_client(db, client):
     rows = query(db, "SELECT * FROM client WHERE nick LIKE %s ORDER BY created", (f'%{client}%',))
@@ -207,6 +253,19 @@ def client_new(db):
 def client_edit(db):
     print("Edit client")
     # Add your editing logic here
+    client_nick = get_arg("CLIENT", "Enter client nickname")
+    client = find_client(db, client_nick)
+    table(client)
+    new = {}
+    for k, v in client.items():
+        new[k] = get_arg(f"CONTACT_{k.upper()}", f"Enter contact {k}", v)
+
+    update(db, "client", new, {'id': new['id']})
+
+    print("Refetching item")
+    client = find_client(db, client_nick)
+    table(client)
+
 
 
 def client_show(db):
@@ -230,6 +289,7 @@ def payment_new(db):
     client_nick = get_arg("CLIENT", "Enter client nickname")
     client = find_client(db, client_nick)
     if client:
+        table(client)
         payments = find_payments_by_client_id(db, client['id'])
         table(payments)
         if len(payments):
