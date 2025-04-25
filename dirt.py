@@ -33,6 +33,7 @@ last_payment_info AS (
         MAX(created::date) AS last_payment_date,
         -- Use a subquery to get the amount corresponding to the last payment date
         (SELECT amount FROM payment p WHERE p.client_id = pp.client_id ORDER BY p.created DESC LIMIT 1) AS last_payment_amount,
+        (SELECT plan FROM payment p WHERE p.client_id = pp.client_id ORDER BY p.created DESC LIMIT 1) AS last_payment_plan,
         COUNT(*) AS total_num_payments,
         SUM(amount) AS total_amount_received,
         SUM(
@@ -65,7 +66,8 @@ SELECT
     COALESCE(lp.last_payment_amount, 0) AS last_pay,
     COALESCE(lp.total_num_payments, 0) AS payments,
     COALESCE(lp.total_amount_received, 0) AS total,
-    lp.payment_type
+    lp.payment_type,
+    lp.last_payment_plan AS plan
 FROM client c
 LEFT JOIN ranked_contacts rc ON rc.client_id = c.id AND rc.rn = 1
 LEFT JOIN last_payment_info lp ON lp.client_id = c.id
@@ -87,6 +89,7 @@ def table(data):
         print("  ".join("-" * col_widths[header] for header in headers))
         for row in data:
             print("  ".join(str(row[header]).ljust(col_widths[header]) for header in headers))
+        print("")
 
 
 def get_arg(name, prompt, default=''):
@@ -200,7 +203,7 @@ def update(db, table, data, where):
 
 # Find a client by nickname
 def find_client(db, client):
-    rows = query(db, "SELECT * FROM client WHERE nick LIKE %s ORDER BY created", (f'%{client}%',))
+    rows = query(db, "SELECT * FROM client WHERE nick ILIKE %s OR name ILIKE %s ORDER BY created", (f'%{client}%',f'%{client}%',))
     if len(rows) > 1:
         for i, row in enumerate(rows, 1):
             print(f"{i}: {row['nick']} ({row['id']} {row['name']})")
@@ -258,7 +261,7 @@ def client_edit(db):
     table(client)
     new = {}
     for k, v in client.items():
-        new[k] = get_arg(f"CONTACT_{k.upper()}", f"Enter contact {k}", v)
+        new[k] = get_arg(f"CLIENT_{k.upper()}", f"Enter client {k}", v)
 
     update(db, "client", new, {'id': new['id']})
 
@@ -329,6 +332,22 @@ def payment_show(db):
     print("Show payment")
 
 
+def contact_new(db):
+    print("Add contact")
+    client_nick = get_arg("CLIENT", "Enter client nickname")
+    client = find_client(db, client_nick)
+    if client:
+        table(client)
+        contact = {}
+        contact['client_id'] = client['id']
+        contact['name'] = get_arg("CONTACT_NAME", f"Enter contact name")
+        contact['email'] = get_arg("CONTACT_EMAIL", f"Enter contact email")
+        contact['role'] = get_arg("CONTACT_ROLE", f"Enter contact role")
+        print("New contact:")
+        table(contact)
+        insert(db, 'contact', contact)
+
+
 def main(db):
 
     if len(sys.argv) < 2:
@@ -342,6 +361,8 @@ eg:
     ./dirt.py client show
 
     ./dirt.py payment new
+
+    ./dirt.py contact new
 """)
         sys.exit(1)
 
@@ -372,6 +393,10 @@ eg:
             payment_show(db)
         else:
             print(f"Unknown action for payment: {action}")
+    elif entity == 'contact':
+        if action == 'new':
+            contact_new(db)
+
     else:
         print(f"Unknown entity: {entity}")
 
