@@ -7,6 +7,44 @@ import psycopg2.extras
 from pprint import pprint
 import datetime
 
+PAYMENT_SIGNUPS = '''
+WITH month_series AS (
+    SELECT generate_series(
+        DATE '2021-01-01',              -- start date (adjust as needed)
+        DATE_TRUNC('month', CURRENT_DATE),
+        INTERVAL '1 month'
+    ) AS first_payment_month
+),
+first_payments AS (
+    SELECT
+        client.id AS client_id,
+        MIN(payment.created) AS first_payment_date
+    FROM
+        payment
+    JOIN
+        client ON payment.client_id = client.id
+    GROUP BY
+        client.id
+),
+clients_by_month AS (
+    SELECT
+        DATE_TRUNC('month', first_payment_date) AS first_payment_month,
+        COUNT(*) AS num_new_clients
+    FROM
+        first_payments
+    GROUP BY
+        first_payment_month
+)
+SELECT
+    CAST(month_series.first_payment_month AS DATE),
+    COALESCE(clients_by_month.num_new_clients, 0) AS num_new_clients
+FROM
+    month_series
+LEFT JOIN
+    clients_by_month ON month_series.first_payment_month = clients_by_month.first_payment_month
+ORDER BY
+    month_series.first_payment_month
+'''
 
 CLIENT_LIST = '''
 WITH
@@ -204,13 +242,33 @@ def update(db, table, data, where):
 # Find a client by nickname
 def find_client(db, client):
     rows = query(db, "SELECT * FROM client WHERE nick ILIKE %s OR name ILIKE %s ORDER BY created", (f'%{client}%',f'%{client}%',))
-    if len(rows) > 1:
+    if len(rows) == 1:
+        return rows[0]
+    elif len(rows) > 1:
         for i, row in enumerate(rows, 1):
             print(f"{i}: {row['nick']} ({row['id']} {row['name']})")
         selected_index = int(input(f"Choose a client (1-{len(rows)}): ")) - 1
         return rows[selected_index]
     else:
-        return rows[0]
+        contact = find_contact(db, client)
+        if contact:
+            table(contact)
+            rows = query(db, "SELECT * FROM client WHERE id = %s", (f'{contact["client_id"]}',))
+            return rows[0]
+
+
+def find_contact(db, client):
+        rows = query(db, "SELECT contact.*, client.id as client_id, client.nick as client_nick, client.name as client_name FROM contact LEFT JOIN client ON client.id = contact.client_id WHERE contact.name ILIKE %s OR contact.email ILIKE %s", (f'%{client}%','%{client}%',))
+        if len(rows) == 1:
+            return rows[0]
+        elif len(rows) > 1:
+            for i, row in enumerate(rows, 1):
+                print(f"{i}: {row['client_nick']} ({row['client_id']} {row['client_name']} / {row['name']})")
+                selected_index = int(input(f"Choose a client (1-{len(rows)}): ")) - 1
+                return rows[selected_index]
+        else:
+            print("No contact found")
+            sys.exit(1)
 
 
 def find_contacts_by_client_id(db, client_id):
@@ -284,6 +342,12 @@ def client_show(db):
 def client_list(db):
     print("List clients")
     rows = query(db, CLIENT_LIST, ())
+    table(rows)
+
+
+def payment_signups(db):
+    print("List new sign-ups over time")
+    rows = query(db, PAYMENT_SIGNUPS, ())
     table(rows)
 
 
@@ -391,6 +455,8 @@ eg:
             payment_edit(db)
         elif action == 'show':
             payment_show(db)
+        elif action == 'signups':
+            payment_signups(db)
         else:
             print(f"Unknown action for payment: {action}")
     elif entity == 'contact':
