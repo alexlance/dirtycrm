@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 import os
 import sys
-import sqlite3
-from pprint import pprint
+import time
 import datetime
+import boto3
+import sqlite3
+import tempfile
+from botocore.exceptions import ClientError
 
+
+BUCKET = os.environ.get('DIRTY_BUCKET')
+DB_FILE = os.environ.get('DIRTY_DB_FILE')
+LOCK_KEY = os.environ.get('DIRTY_LOCK_KEY')
+LOCK_TTL = os.environ.get('DIRTY_LOCK_TTL')
+REGION = os.environ.get('DIRTY_REGION')
+if not DB_FILE or not BUCKET or not LOCK_KEY or not LOCK_TTL or not REGION:
+    print("Missing configuration. Try: source .env")
+    sys.exit(1)
 
 PAYMENT_SIGNUPS = '''
 WITH RECURSIVE month_series(first_payment_month) AS (
@@ -54,7 +66,7 @@ ranked_contacts AS (
         ct.client_id,
         ct.name AS contact_name,
         ct.email AS contact_email,
-        ROW_NUMBER() OVER (PARTITION BY ct.client_id ORDER BY (role = ''), role) AS rn
+        ROW_NUMBER() OVER (PARTITION BY ct.client_id ORDER BY (role = 'payer') DESC, role) AS rn
     FROM contact ct
 ),
 ranked_events AS (
@@ -69,7 +81,7 @@ ranked_events AS (
 last_payment_info AS (
     SELECT
         client_id,
-        MAX(created) AS last_payment_date,
+        date(MAX(created)) AS last_payment_date,
         -- Use a subquery to get the amount corresponding to the last payment date
         (SELECT amount FROM payment p WHERE p.client_id = pp.client_id ORDER BY p.created DESC LIMIT 1) AS last_payment_amount,
         (SELECT plan FROM payment p WHERE p.client_id = pp.client_id ORDER BY p.created DESC LIMIT 1) AS last_payment_plan,
@@ -101,11 +113,11 @@ SELECT
     c.status AS status,
     rc.contact_name,
     rc.contact_email,
-    COALESCE(lp.last_payment_date, NULL) AS last_pay_date,
+    COALESCE(lp.last_payment_date, NULL) AS last_pay_d,
     COALESCE(lp.last_payment_amount, 0) AS last_pay,
     COALESCE(lp.total_num_payments, 0) AS payments,
     COALESCE(lp.total_amount_received, 0) AS total,
-    lp.payment_type,
+    lp.payment_type as type,
     lp.last_payment_plan AS plan
 FROM client c
 LEFT JOIN ranked_contacts rc ON rc.client_id = c.id AND rc.rn = 1
@@ -113,6 +125,47 @@ LEFT JOIN last_payment_info lp ON lp.client_id = c.id
 LEFT JOIN recent_events re ON re.client_id = c.id
 ORDER BY c.status, c.created
 '''
+
+
+def acquire_lock():
+    s3 = boto3.client('s3', region_name=REGION)
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=LOCK_KEY,
+            Body=b'locked',  # minimal content
+            ContentType='text/plain',
+            Metadata={
+                'created': str(int(time.time()))
+            },
+            IfNoneMatch='*'
+        )
+        # print(f"Lock acquired {LOCK_KEY}")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'PreconditionFailed':
+            print("Lock already held")
+            return False
+        else:
+            print(f"Unexpected error: {e}")
+            raise
+
+
+def release_lock():
+    s3 = boto3.client('s3', region_name=REGION)
+    s3.delete_object(Bucket=BUCKET, Key=LOCK_KEY)
+    # print(f"Lock released {LOCK_KEY}")
+
+
+def is_lock_stale():
+    s3 = boto3.client('s3', region_name=REGION)
+    try:
+        response = s3.head_object(Bucket=BUCKET, Key=LOCK_KEY)
+        created = int(response['Metadata'].get('created', '0'))
+        age = int(time.time()) - created
+        return age > LOCK_TTL
+    except ClientError:
+        return False
 
 
 def table(data):
@@ -143,13 +196,12 @@ def get_arg(name, prompt, default=''):
         return os.environ.get(name)
 
 
-def initialize_db_connection():
-    db_path = os.environ.get('DIRTY_DB_PATH', './secret/dibs.sqlite')  # Path to your SQLite file
+def initialize_db_connection(path):
+    db_path = os.environ.get('DIRTY_DB_PATH', path)  # Path to your SQLite file
 
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        # enable foreign keys enforcement in SQLite
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
     except Exception as e:
@@ -195,38 +247,27 @@ def update(db, table, data, where):
     columns = list(data.keys())
     values = list(data.values())
 
-    # Fix dates from datetime.datetime.now() to normal ISO format for db
+    # Format datetime values to ISO format
     values = [
-        value.strftime('%Y-%m-%d %H:%M:%S%z') if isinstance(value, datetime.datetime) else value
+        value.strftime('%Y-%m-%d %H:%M:%S') if isinstance(value, datetime.datetime) else value
         for value in values
     ]
 
-    # Generate the SET part of the query (column = value)
-    set_clause = sql.SQL(", ").join(
-        sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()) for col in columns
-    )
+    # Build the SET clause like "col1 = ?, col2 = ?"
+    set_clause = ", ".join(f"{col} = ?" for col in columns)
 
-    # Build the WHERE part of the query from the 'where' dictionary
-    where_clause = sql.SQL(" AND ").join(
-        sql.SQL("{} = {}").format(sql.Identifier(k), sql.Placeholder()) for k in where.keys()
-    )
+    # Build the WHERE clause like "id = ? AND name = ?"
+    where_clause = " AND ".join(f"{k} = ?" for k in where.keys())
 
-    # Construct the final query
-    query = sql.SQL("UPDATE {} SET {} WHERE {}").format(
-        sql.Identifier(table),  # Safely insert the table name
-        set_clause,  # SET clause for column-value pairs
-        where_clause  # WHERE clause to filter the rows
-    )
+    # Final SQL string
+    query = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
 
     try:
         # Combine values from data and where
         query_values = values + list(where.values())
         cursor.execute(query, query_values)
         db.commit()
-        if cursor.rowcount > 0:
-            return True  # Return True if at least one row was updated
-        else:
-            return False  # Return False if no rows were updated
+        return cursor.rowcount > 0
     except Exception as e:
         db.rollback()
         print(f"Error updating record: {e}")
@@ -237,7 +278,7 @@ def update(db, table, data, where):
 
 # Find a client by nickname
 def find_client(db, client):
-    rows = query(db, "SELECT * FROM client WHERE nick LIKE %s OR name LIKE %s ORDER BY created", (f'%{client}%',f'%{client}%',))
+    rows = query(db, "SELECT * FROM client WHERE nick LIKE %s OR name LIKE %s ORDER BY created", (f'%{client}%', f'%{client}%',))
     if len(rows) == 1:
         return rows[0]
     elif len(rows) > 1:
@@ -254,17 +295,17 @@ def find_client(db, client):
 
 
 def find_contact(db, client):
-        rows = query(db, "SELECT contact.*, client.id as client_id, client.nick as client_nick, client.name as client_name FROM contact LEFT JOIN client ON client.id = contact.client_id WHERE contact.name LIKE %s OR contact.email LIKE %s", (f'%{client}%','%{client}%',))
-        if len(rows) == 1:
-            return rows[0]
-        elif len(rows) > 1:
-            for i, row in enumerate(rows, 1):
-                print(f"{i}: {row['client_nick']} ({row['client_id']} {row['client_name']} / {row['name']})")
-                selected_index = int(input(f"Choose a client (1-{len(rows)}): ")) - 1
-                return rows[selected_index]
-        else:
-            print("No contact found")
-            sys.exit(1)
+    rows = query(db, "SELECT contact.* FROM contact WHERE contact.name LIKE %s OR contact.email LIKE %s", (f'%{client}%', '%{client}%',))
+    if len(rows) == 1:
+        return rows[0]
+    elif len(rows) > 1:
+        for i, row in enumerate(rows, 1):
+            print(f"{i}: client_id: {row['client_id']} contact_name: {row['name']})")
+            selected_index = int(input(f"Choose a client (1-{len(rows)}): ")) - 1
+            return rows[selected_index]
+    else:
+        print("No contact found")
+        sys.exit(1)
 
 
 def find_contacts_by_client_id(db, client_id):
@@ -293,7 +334,7 @@ def client_new(db):
     client["created"] = datetime.datetime.now()
     client["status"] = "active"
     client["team"] = get_arg("CLIENT_TEAM", "Enter client's Slack Team ID")
-    print(f"Inserting new client:")
+    print("Inserting new client:")
     table(client)
     client_id = insert(db, 'client', client)
     if client_id:
@@ -302,7 +343,7 @@ def client_new(db):
         contact["name"] = get_arg("CONTACT_NAME", "Enter contact full name")
         contact["email"] = get_arg("CONTACT_EMAIL", "Enter contact email address")
         contact["role"] = get_arg("CONTACT_ROLE", "Enter contact role (payer or blank)")
-        print(f"Inserting new contact:")
+        print("Inserting new contact:")
         table(contact)
         insert(db, 'contact', contact)
 
@@ -322,7 +363,6 @@ def client_edit(db):
     print("Refetching item")
     client = find_client(db, client_nick)
     table(client)
-
 
 
 def client_show(db):
@@ -356,7 +396,7 @@ def payment_new(db):
         payments = find_payments_by_client_id(db, client['id'])
         table(payments)
         if len(payments):
-            last = len(payments)-1
+            last = len(payments) - 1
             defaults = {}
             defaults['amount'] = payments[last]['amount']
             defaults['client_id'] = payments[last]['client_id']
@@ -390,6 +430,12 @@ def payment_edit(db):
 
 def payment_show(db):
     print("Show payment")
+    client_nick = get_arg("CLIENT", "Enter client nickname")
+    client = find_client(db, client_nick)
+    payments = find_payments_by_client_id(db, client['id'])
+    table(client)
+    print("")
+    table(payments)
 
 
 def contact_new(db):
@@ -400,16 +446,71 @@ def contact_new(db):
         table(client)
         contact = {}
         contact['client_id'] = client['id']
-        contact['name'] = get_arg("CONTACT_NAME", f"Enter contact name")
-        contact['email'] = get_arg("CONTACT_EMAIL", f"Enter contact email")
-        contact['role'] = get_arg("CONTACT_ROLE", f"Enter contact role")
+        contact['name'] = get_arg("CONTACT_NAME", "Enter contact name")
+        contact['email'] = get_arg("CONTACT_EMAIL", "Enter contact email")
+        contact['role'] = get_arg("CONTACT_ROLE", "Enter contact role")
         print("New contact:")
         table(contact)
         insert(db, 'contact', contact)
 
 
-def main(db):
+def contact_edit(db):
+    print("Edit contact")
+    # Add your editing logic here
+    contact_nick = get_arg("CONTACT", "Enter contact name or email")
+    contact = find_contact(db, contact_nick)
+    table(contact)
+    new = {}
+    for k, v in contact.items():
+        new[k] = get_arg(f"CONTACT_{k.upper()}", f"Enter contact {k}", v)
 
+    update(db, "contact", new, {'id': new['id']})
+
+    print("Refetching item")
+    contact = find_contact(db, contact_nick)
+    table(contact)
+
+
+def sync_db_to_s3(temp):
+    if make_s3_backup():
+        s3 = boto3.client("s3", region_name=REGION)
+        s3.upload_file(
+            Filename=temp.name,
+            Bucket=BUCKET,
+            Key=DB_FILE
+        )
+    else:
+        print("ERROR CANT MAKE BACKUP")
+
+
+def make_s3_backup():
+    s3 = boto3.client("s3", region_name=REGION)
+    today = datetime.datetime.now()
+    day_of_year = today.timetuple().tm_yday
+
+    copy_source = {
+        'Bucket': BUCKET,
+        'Key': DB_FILE
+    }
+    s3.copy_object(
+        Bucket=BUCKET,
+        CopySource=copy_source,
+        Key=f"{DB_FILE}.{day_of_year}"
+    )
+    print(f"Created backup: {DB_FILE}.{day_of_year}")
+    return True
+
+
+def load_sqlite_from_s3(temp):
+    s3 = boto3.client('s3', region_name=REGION)
+    response = s3.get_object(Bucket=BUCKET, Key=DB_FILE)
+    sqlite_bytes = response['Body'].read()
+    temp.write(sqlite_bytes)
+    temp.flush()  # Make sure all data is written
+    return initialize_db_connection(temp.name)
+
+
+def main(db, temp):
     if len(sys.argv) < 2:
         print("""Usage:
 
@@ -419,11 +520,14 @@ eg:
     ./dirt.py client
     ./dirt.py client new
     ./dirt.py client show
+    ./dirt.py client edit
 
     ./dirt.py payment new
+    ./dirt.py payment show
     ./dirt.py payment signups
 
     ./dirt.py contact new
+    ./dirt.py contact edit
 
 """)
         sys.exit(1)
@@ -437,8 +541,10 @@ eg:
     if entity == 'client':
         if action == 'new':
             client_new(db)
+            sync_db_to_s3(temp)
         elif action == 'edit':
             client_edit(db)
+            sync_db_to_s3(temp)
         elif action == 'show':
             client_show(db)
         elif action == '':
@@ -449,8 +555,10 @@ eg:
     elif entity == 'payment':
         if action == 'new':
             payment_new(db)
+            sync_db_to_s3(temp)
         elif action == 'edit':
             payment_edit(db)
+            sync_db_to_s3(temp)
         elif action == 'show':
             payment_show(db)
         elif action == 'signups':
@@ -460,13 +568,31 @@ eg:
     elif entity == 'contact':
         if action == 'new':
             contact_new(db)
+            sync_db_to_s3(temp)
+        elif action == 'edit':
+            contact_edit(db)
+            sync_db_to_s3(temp)
+        else:
+            print(f"Unknown action for contact: {action}")
 
     else:
         print(f"Unknown entity: {entity}")
 
+
 if __name__ == "__main__":
-    try:
-        connection = initialize_db_connection()
-        main(connection)
-    finally:
-        connection.close()
+    with tempfile.NamedTemporaryFile(suffix=".sqlite") as temp:
+        try:
+            if acquire_lock():
+                connection = load_sqlite_from_s3(temp)
+                main(connection, temp)
+            else:
+                if is_lock_stale():
+                    print('lock is stale, releasing... try again')
+                    release_lock()
+
+                else:
+                    print('thingo is locked, try again in 120 seconds')
+
+        finally:
+            connection.close()
+            release_lock()
