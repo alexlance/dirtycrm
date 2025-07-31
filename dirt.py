@@ -1,50 +1,51 @@
 #!/usr/bin/env python3
 import os
 import sys
-import psycopg2
-from psycopg2 import sql
-import psycopg2.extras
+import sqlite3
 from pprint import pprint
 import datetime
 
+
 PAYMENT_SIGNUPS = '''
-WITH month_series AS (
-    SELECT generate_series(
-        DATE '2021-01-01',              -- start date (adjust as needed)
-        DATE_TRUNC('month', CURRENT_DATE),
-        INTERVAL '1 month'
-    ) AS first_payment_month
+WITH RECURSIVE month_series(first_payment_month) AS (
+  SELECT strftime('%Y-%m-01', '2021-01-01')
+  UNION ALL
+  SELECT strftime('%Y-%m-01', date(first_payment_month, '+1 month'))
+  FROM month_series
+  WHERE first_payment_month < strftime('%Y-%m-01', 'now')
 ),
 first_payments AS (
-    SELECT
-        client.id AS client_id,
-        MIN(payment.created) AS first_payment_date
-    FROM
-        payment
-    JOIN
-        client ON payment.client_id = client.id
-    GROUP BY
-        client.id
+  SELECT
+    client.id AS client_id,
+    MIN(date(payment.created)) AS first_payment_date
+  FROM
+    payment
+  JOIN
+    client ON payment.client_id = client.id
+  GROUP BY
+    client.id
 ),
 clients_by_month AS (
-    SELECT
-        DATE_TRUNC('month', first_payment_date) AS first_payment_month,
-        COUNT(*) AS num_new_clients
-    FROM
-        first_payments
-    GROUP BY
-        first_payment_month
+  SELECT
+    strftime('%Y-%m-01', first_payment_date) AS first_payment_month,
+    COUNT(*) AS num_new_clients
+  FROM
+    first_payments
+  GROUP BY
+    strftime('%Y-%m-01', first_payment_date)
 )
 SELECT
-    CAST(month_series.first_payment_month AS DATE),
-    COALESCE(clients_by_month.num_new_clients, 0) AS num_new_clients
+  month_series.first_payment_month,
+  COALESCE(clients_by_month.num_new_clients, 0) AS num_new_clients
 FROM
-    month_series
+  month_series
 LEFT JOIN
-    clients_by_month ON month_series.first_payment_month = clients_by_month.first_payment_month
+  clients_by_month ON month_series.first_payment_month = clients_by_month.first_payment_month
 ORDER BY
-    month_series.first_payment_month
+  month_series.first_payment_month;
+
 '''
+
 
 CLIENT_LIST = '''
 WITH
@@ -68,7 +69,7 @@ ranked_events AS (
 last_payment_info AS (
     SELECT
         client_id,
-        MAX(created::date) AS last_payment_date,
+        MAX(created) AS last_payment_date,
         -- Use a subquery to get the amount corresponding to the last payment date
         (SELECT amount FROM payment p WHERE p.client_id = pp.client_id ORDER BY p.created DESC LIMIT 1) AS last_payment_amount,
         (SELECT plan FROM payment p WHERE p.client_id = pp.client_id ORDER BY p.created DESC LIMIT 1) AS last_payment_plan,
@@ -143,23 +144,22 @@ def get_arg(name, prompt, default=''):
 
 
 def initialize_db_connection():
-    db_config = {
-        'dbname': os.environ.get('DIRTY_DB'),
-        'user': os.environ.get('DIRTY_USER'),
-        'password': os.environ.get('DIRTY_PASS'),
-        'host': os.environ.get('DIRTY_HOST'),
-        'port': os.environ.get('DIRTY_PORT')
-    }
+    db_path = os.environ.get('DIRTY_DB_PATH', './secret/dibs.sqlite')  # Path to your SQLite file
+
     try:
-        return psycopg2.connect(**db_config)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        # enable foreign keys enforcement in SQLite
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return conn
     except Exception as e:
-        print(f"Error initializing database connection: {e}")
+        print(f"Error initializing SQLite database connection: {e}")
         return None
 
 
 def query(db, query, args):
-    cursor = db.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    query = sql.SQL(query)
+    cursor = db.cursor()
+    query = query.replace("%s", "?")  # postgres format vs sqlite format
     cursor.execute(query, args)
     rows = cursor.fetchall()
     return [dict(row) for row in rows]
@@ -168,24 +168,20 @@ def query(db, query, args):
 def insert(db, table, data):
     cursor = db.cursor()
     columns = list(data.keys())
-    values = list(data.values())
-
-    # fix dates from datetime.datetime.now() to normal iso format for db
     values = [
-        value.strftime('%Y-%m-%d %H:%M:%S%z') if isinstance(value, datetime.datetime) else value
-        for value in values
+        value.strftime('%Y-%m-%d %H:%M:%S') if isinstance(value, datetime.datetime) else value
+        for value in data.values()
     ]
-    query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING id").format(
-        sql.Identifier(table),  # Safely insert the table name
-        sql.SQL(", ").join(map(sql.Identifier, columns)),  # Safely insert column names
-        sql.SQL(", ").join(sql.Placeholder() * len(columns))  # Generate placeholders for values
-    )
+
+    # Build query string with ? placeholders
+    col_str = ', '.join(columns)
+    placeholders = ', '.join(['?'] * len(columns))
+    query = f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})"
 
     try:
         cursor.execute(query, values)
-        new_id = cursor.fetchone()[0]  # Fetch the generated ID
         db.commit()
-        return new_id
+        return cursor.lastrowid  # ID of the inserted row
     except Exception as e:
         db.rollback()
         print(f"Error inserting record: {e}")
@@ -241,7 +237,7 @@ def update(db, table, data, where):
 
 # Find a client by nickname
 def find_client(db, client):
-    rows = query(db, "SELECT * FROM client WHERE nick ILIKE %s OR name ILIKE %s ORDER BY created", (f'%{client}%',f'%{client}%',))
+    rows = query(db, "SELECT * FROM client WHERE nick LIKE %s OR name LIKE %s ORDER BY created", (f'%{client}%',f'%{client}%',))
     if len(rows) == 1:
         return rows[0]
     elif len(rows) > 1:
@@ -258,7 +254,7 @@ def find_client(db, client):
 
 
 def find_contact(db, client):
-        rows = query(db, "SELECT contact.*, client.id as client_id, client.nick as client_nick, client.name as client_name FROM contact LEFT JOIN client ON client.id = contact.client_id WHERE contact.name ILIKE %s OR contact.email ILIKE %s", (f'%{client}%','%{client}%',))
+        rows = query(db, "SELECT contact.*, client.id as client_id, client.nick as client_nick, client.name as client_name FROM contact LEFT JOIN client ON client.id = contact.client_id WHERE contact.name LIKE %s OR contact.email LIKE %s", (f'%{client}%','%{client}%',))
         if len(rows) == 1:
             return rows[0]
         elif len(rows) > 1:
@@ -425,8 +421,10 @@ eg:
     ./dirt.py client show
 
     ./dirt.py payment new
+    ./dirt.py payment signups
 
     ./dirt.py contact new
+
 """)
         sys.exit(1)
 
