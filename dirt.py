@@ -293,15 +293,15 @@ def find_client(db, client):
             return rows[0]
 
 
-def find_contact(db, client):
-    rows = query(db, "SELECT contact.* FROM contact WHERE contact.name LIKE %s OR contact.email LIKE %s", (f'%{client}%', '%{client}%',))
+def find_contact(db, contact):
+    rows = query(db, "SELECT * FROM contact WHERE name LIKE %s OR email LIKE %s", (f'%{contact}%', f'%{contact}%',))
     if len(rows) == 1:
         return rows[0]
     elif len(rows) > 1:
         for i, row in enumerate(rows, 1):
-            print(f"{i}: client_id: {row['client_id']} contact_name: {row['name']})")
-            selected_index = int(input(f"Choose a client (1-{len(rows)}): ")) - 1
-            return rows[selected_index]
+            print(f"{i}: client_id: {row['client_id']} contact: {row['name']})")
+        selected_index = int(input(f"Choose a contact (1-{len(rows)}): ")) - 1
+        return rows[selected_index]
     else:
         print("No contact found")
         sys.exit(1)
@@ -591,6 +591,7 @@ if __name__ == "__main__":
                 connection = initialize_db_connection(temp.name)
                 changed = main(connection)
                 if changed:
+                    connection.close()
                     put_db_to_s3(temp.name)
         finally:
             release_lock()
