@@ -198,7 +198,6 @@ def get_arg(name, prompt, default=''):
 
 def initialize_db_connection(path):
     db_path = os.environ.get('DIRTY_DB_PATH', path)  # Path to your SQLite file
-
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
@@ -471,11 +470,11 @@ def contact_edit(db):
     table(contact)
 
 
-def sync_db_to_s3(temp):
+def put_db_to_s3(local_db_file):
     if make_s3_backup():
         s3 = boto3.client("s3", region_name=REGION)
         s3.upload_file(
-            Filename=temp.name,
+            Filename=local_db_file,
             Bucket=BUCKET,
             Key=DB_FILE
         )
@@ -501,16 +500,15 @@ def make_s3_backup():
     return True
 
 
-def load_sqlite_from_s3(temp):
+def fetch_db_from_s3(temp):
     s3 = boto3.client('s3', region_name=REGION)
     response = s3.get_object(Bucket=BUCKET, Key=DB_FILE)
     sqlite_bytes = response['Body'].read()
     temp.write(sqlite_bytes)
     temp.flush()  # Make sure all data is written
-    return initialize_db_connection(temp.name)
 
 
-def main(db, temp):
+def main(db):
     if len(sys.argv) < 2:
         print("""Usage:
 
@@ -538,13 +536,15 @@ eg:
     except IndexError:
         action = ''
 
+    needs_sync = False
+
     if entity == 'client':
         if action == 'new':
             client_new(db)
-            sync_db_to_s3(temp)
+            needs_sync = True
         elif action == 'edit':
             client_edit(db)
-            sync_db_to_s3(temp)
+            needs_sync = True
         elif action == 'show':
             client_show(db)
         elif action == '':
@@ -555,44 +555,50 @@ eg:
     elif entity == 'payment':
         if action == 'new':
             payment_new(db)
-            sync_db_to_s3(temp)
+            needs_sync = True
         elif action == 'edit':
             payment_edit(db)
-            sync_db_to_s3(temp)
+            needs_sync = True
         elif action == 'show':
             payment_show(db)
         elif action == 'signups':
             payment_signups(db)
         else:
             print(f"Unknown action for payment: {action}")
+
     elif entity == 'contact':
         if action == 'new':
             contact_new(db)
-            sync_db_to_s3(temp)
+            needs_sync = True
         elif action == 'edit':
             contact_edit(db)
-            sync_db_to_s3(temp)
+            needs_sync = True
         else:
             print(f"Unknown action for contact: {action}")
 
     else:
         print(f"Unknown entity: {entity}")
 
+    return needs_sync
+
 
 if __name__ == "__main__":
-    with tempfile.NamedTemporaryFile(suffix=".sqlite") as temp:
+    connection = None
+    if acquire_lock():
         try:
-            if acquire_lock():
-                connection = load_sqlite_from_s3(temp)
-                main(connection, temp)
-            else:
-                if is_lock_stale():
-                    print('lock is stale, releasing... try again')
-                    release_lock()
-
-                else:
-                    print('thingo is locked, try again in 120 seconds')
-
+            with tempfile.NamedTemporaryFile(suffix=".sqlite") as temp:
+                fetch_db_from_s3(temp)
+                connection = initialize_db_connection(temp.name)
+                changed = main(connection)
+                if changed:
+                    put_db_to_s3(temp.name)
         finally:
-            connection.close()
             release_lock()
+            if connection:
+                connection.close()
+    else:
+        if is_lock_stale():
+            print('lock is stale, releasing... try again')
+            release_lock()
+        else:
+            print('Database in S3 is in use/locked, try again in 120 seconds')
