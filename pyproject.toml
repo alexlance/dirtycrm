@@ -6,5 +6,5 @@ build-backend = "setuptools.build_meta"
 name = "dirtycrm"
 version = "0.1.0"
 description = "The quickest dirtiest crm"
-authors = [{ name = "Alex Lance", email = "" }]
+authors = [{ name = "Alex Lance", email = "dirtycrm@example.com" }]
 dependencies = []
