@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel", "sqlite3"]
+requires = ["setuptools", "wheel", "sqlite"]
 build-backend = "setuptools.build_meta"
 
 [project]
