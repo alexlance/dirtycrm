@@ -9,15 +9,6 @@ import tempfile
 from botocore.exceptions import ClientError
 
 
-BUCKET = os.environ.get('DIRTY_BUCKET')
-DB_FILE = os.environ.get('DIRTY_DB_FILE')
-LOCK_KEY = os.environ.get('DIRTY_LOCK_KEY')
-LOCK_TTL = os.environ.get('DIRTY_LOCK_TTL')
-REGION = os.environ.get('DIRTY_REGION')
-if not DB_FILE or not BUCKET or not LOCK_KEY or not LOCK_TTL or not REGION:
-    print("Missing configuration. Try: source .env")
-    sys.exit(1)
-
 PAYMENT_SIGNUPS = '''
 WITH RECURSIVE month_series(first_payment_month) AS (
   SELECT strftime('%Y-%m-01', '2021-01-01')
@@ -309,12 +300,14 @@ def find_contact(db, contact):
 
 def find_contacts_by_client_id(db, client_id):
     rows = query(db, "SELECT * FROM contact WHERE client_id = %s", (client_id,))
-    return rows
+    if rows:
+        return rows
 
 
 def find_contact_by_email(db, email):
     rows = query(db, "SELECT * FROM contact WHERE email = %s", (email,))
-    return rows[0]
+    if rows:
+        return rows[0]
 
 
 def find_payments_by_client_id(db, client_id):
@@ -345,6 +338,7 @@ def client_new(db):
         print("Inserting new contact:")
         table(contact)
         insert(db, 'contact', contact)
+    return client_id
 
 
 def client_edit(db):
@@ -583,6 +577,15 @@ eg:
 
 
 if __name__ == "__main__":
+    BUCKET = os.environ.get('DIRTY_BUCKET')
+    DB_FILE = os.environ.get('DIRTY_DB_FILE')
+    LOCK_KEY = os.environ.get('DIRTY_LOCK_KEY')
+    LOCK_TTL = os.environ.get('DIRTY_LOCK_TTL')
+    REGION = os.environ.get('DIRTY_REGION')
+    if not DB_FILE or not BUCKET or not LOCK_KEY or not LOCK_TTL or not REGION:
+        print("Missing configuration. Try: source .env")
+        sys.exit(1)
+
     connection = None
     if acquire_lock():
         try:
