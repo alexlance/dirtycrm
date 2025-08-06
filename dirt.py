@@ -506,6 +506,7 @@ def fetch_db_from_s3(temp):
     sqlite_bytes = response['Body'].read()
     temp.write(sqlite_bytes)
     temp.flush()  # Make sure all data is written
+    print(f"Database file: {temp.name}")
 
 
 def main(db):
@@ -526,6 +527,8 @@ eg:
 
     ./dirt.py contact new
     ./dirt.py contact edit
+
+    ./dirt.py db
 
 """)
         sys.exit(1)
@@ -575,6 +578,12 @@ eg:
             needs_sync = True
         else:
             print(f"Unknown action for contact: {action}")
+
+    elif entity == 'db':
+        print('Run sqlite in a separate window now')
+        yn = input('Sync db back to S3? [y/n]')
+        if yn.lower() != 'n':
+            needs_sync = True
 
     else:
         print(f"Unknown entity: {entity}")
