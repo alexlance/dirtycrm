@@ -7,7 +7,14 @@ import boto3
 import sqlite3
 import tempfile
 from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+from pathlib import Path
 
+script_path = Path(__file__).resolve()
+script_dir = script_path.parent
+env_path = script_dir / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
 
 BUCKET = os.environ.get('DIRTY_BUCKET')
 DB_FILE = os.environ.get('DIRTY_DB_FILE')
