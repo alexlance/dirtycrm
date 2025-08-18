@@ -131,6 +131,32 @@ ORDER BY c.status, c.created
 '''
 
 
+# decorator pattern
+def fetch_crm(fn):
+    def wrapper(*args, **kwargs):
+        connection = None
+        if acquire_lock():
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".sqlite") as temp:
+                    fetch_db_from_s3(temp)
+                    connection = initialize_db_connection(temp.name)
+                    rows = fn(connection, *args, **kwargs)
+                    if not isinstance(rows, list) and rows:
+                        put_db_to_s3(temp.name)  # if boolean, then assume it's an indication to write the db
+                    return rows
+            finally:
+                release_lock()
+                if connection:
+                    connection.close()
+        else:
+            if is_lock_stale():
+                print('lock is stale, releasing... try again')
+                release_lock()
+            else:
+                print('Database in S3 is in use/locked, try again in 120 seconds')
+    return wrapper
+
+
 def acquire_lock():
     s3 = boto3.client('s3', region_name=REGION)
     try:
@@ -516,7 +542,8 @@ def fetch_db_from_s3(temp):
     print(f"Database file: {temp.name}")
 
 
-def main(db):
+@fetch_crm
+def main(db, *args, **kwargs):
     if len(sys.argv) < 2:
         print("""Usage:
 
@@ -602,24 +629,4 @@ if __name__ == "__main__":
     if not DB_FILE or not BUCKET or not LOCK_KEY or not LOCK_TTL or not REGION:
         print("Missing configuration. Try: source .env")
         sys.exit(1)
-
-    connection = None
-    if acquire_lock():
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".sqlite") as temp:
-                fetch_db_from_s3(temp)
-                connection = initialize_db_connection(temp.name)
-                changed = main(connection)
-                if changed:
-                    connection.close()
-                    put_db_to_s3(temp.name)
-        finally:
-            release_lock()
-            if connection:
-                connection.close()
-    else:
-        if is_lock_stale():
-            print('lock is stale, releasing... try again')
-            release_lock()
-        else:
-            print('Database in S3 is in use/locked, try again in 120 seconds')
+    main()
