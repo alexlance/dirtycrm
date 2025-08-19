@@ -19,8 +19,9 @@ if env_path.exists():
 BUCKET = os.environ.get('DIRTY_BUCKET')
 DB_FILE = os.environ.get('DIRTY_DB_FILE')
 LOCK_KEY = os.environ.get('DIRTY_LOCK_KEY')
-LOCK_TTL = os.environ.get('DIRTY_LOCK_TTL')
+LOCK_TTL = int(os.environ.get('DIRTY_LOCK_TTL'))
 REGION = os.environ.get('DIRTY_REGION')
+TEMPFILENAME = ""
 
 PAYMENT_SIGNUPS = '''
 WITH RECURSIVE month_series(first_payment_month) AS (
@@ -134,51 +135,54 @@ ORDER BY c.status, c.created
 # decorator pattern
 def fetch_crm(fn):
     def wrapper(*args, **kwargs):
+        global TEMPFILENAME
         connection = None
         if acquire_lock():
             try:
                 with tempfile.NamedTemporaryFile(suffix=".sqlite") as temp:
+                    TEMPFILENAME = temp.name  # for "dirt db"
                     fetch_db_from_s3(temp)
                     connection = initialize_db_connection(temp.name)
                     rows = fn(connection, *args, **kwargs)
-                    if not isinstance(rows, list) and rows:
-                        put_db_to_s3(temp.name)  # if boolean, then assume it's an indication to write the db
+                    if connection.total_changes > 0:
+                        put_db_to_s3(temp.name)
                     return rows
             finally:
                 release_lock()
                 if connection:
                     connection.close()
-        else:
-            if is_lock_stale():
-                print('lock is stale, releasing... try again')
-                release_lock()
-            else:
-                print('Database in S3 is in use/locked, try again in 120 seconds')
     return wrapper
 
 
 def acquire_lock():
     s3 = boto3.client('s3', region_name=REGION)
-    try:
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=LOCK_KEY,
-            Body=b'locked',  # minimal content
-            ContentType='text/plain',
-            Metadata={
-                'created': str(int(time.time()))
-            },
-            IfNoneMatch='*'
-        )
-        # print(f"Lock acquired {LOCK_KEY}")
-        return True
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'PreconditionFailed':
-            print("Lock already held")
-            return False
-        else:
-            print(f"Unexpected error: {e}")
-            raise
+    x = 0
+    while x < LOCK_TTL:
+        x += 1
+        try:
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=LOCK_KEY,
+                Body=b'locked',  # minimal content
+                ContentType='text/plain',
+                Metadata={
+                    'created': str(int(time.time()))
+                },
+                IfNoneMatch='*'
+            )
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'PreconditionFailed':
+                print("Lock already held")
+                if is_lock_stale():
+                    print('Lock is stale, releasing...')
+                    release_lock()
+            else:
+                print(f"Unexpected error: {e}")
+                raise
+        time.sleep(1)
+    print("Timed out. Couldn't acquire lock on sqlite database. Exiting")
+    sys.exit(1)
 
 
 def release_lock():
@@ -511,6 +515,7 @@ def put_db_to_s3(local_db_file):
             Bucket=BUCKET,
             Key=DB_FILE
         )
+        print(f"Synced database to: s3://{BUCKET}/{DB_FILE}")
     else:
         print("ERROR CANT MAKE BACKUP")
 
@@ -573,15 +578,11 @@ eg:
     except IndexError:
         action = ''
 
-    needs_sync = False
-
     if entity == 'client':
         if action == 'new':
             client_new(db)
-            needs_sync = True
         elif action == 'edit':
             client_edit(db)
-            needs_sync = True
         elif action == 'show':
             client_show(db)
         elif action == '':
@@ -592,10 +593,8 @@ eg:
     elif entity == 'payment':
         if action == 'new':
             payment_new(db)
-            needs_sync = True
         elif action == 'edit':
             payment_edit(db)
-            needs_sync = True
         elif action == 'show':
             payment_show(db)
         elif action == 'signups':
@@ -606,23 +605,21 @@ eg:
     elif entity == 'contact':
         if action == 'new':
             contact_new(db)
-            needs_sync = True
         elif action == 'edit':
             contact_edit(db)
-            needs_sync = True
         else:
             print(f"Unknown action for contact: {action}")
 
     elif entity == 'db':
         print('Run sqlite in a separate window now')
-        yn = input('Sync db back to S3? [y/n]')
+        yn = input('Sync db? [Y/n]')
         if yn.lower() != 'n':
-            needs_sync = True
+            put_db_to_s3(TEMPFILENAME)
 
     else:
         print(f"Unknown entity: {entity}")
 
-    return needs_sync
+    return
 
 
 if __name__ == "__main__":
