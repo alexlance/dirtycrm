@@ -19,7 +19,7 @@ if env_path.exists():
 BUCKET = os.environ.get('DIRTY_BUCKET')
 DB_FILE = os.environ.get('DIRTY_DB_FILE')
 LOCK_KEY = os.environ.get('DIRTY_LOCK_KEY')
-LOCK_TTL = int(os.environ.get('DIRTY_LOCK_TTL'))
+LOCK_TTL = os.environ.get('DIRTY_LOCK_TTL', 120)
 REGION = os.environ.get('DIRTY_REGION')
 TEMPFILENAME = ""
 
@@ -157,7 +157,7 @@ def fetch_crm(fn):
 def acquire_lock():
     s3 = boto3.client('s3', region_name=REGION)
     x = 0
-    while x < LOCK_TTL:
+    while x < int(LOCK_TTL):
         x += 1
         try:
             s3.put_object(
@@ -197,7 +197,7 @@ def is_lock_stale():
         response = s3.head_object(Bucket=BUCKET, Key=LOCK_KEY)
         created = int(response['Metadata'].get('created', '0'))
         age = int(time.time()) - created
-        return age > LOCK_TTL
+        return age > int(LOCK_TTL)
     except ClientError:
         return False
 
